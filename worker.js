@@ -1,7 +1,4 @@
-// stitch-server/server.js
 require("dotenv").config();
-
-const express = require("express");
 
 // fetch fallback for Node < 18
 let fetchFn = globalThis.fetch;
@@ -22,24 +19,67 @@ const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const ffprobePath = require("@ffprobe-installer/ffprobe").path;
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
-const cors = require("cors");
-const multer = require("multer");
+const mongoose = require("mongoose");
+const redis = require("redis");
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
-/* ---------- Config ---------- */
+// MongoDB connection - Fixed connection string
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://hellobittukumar12_db_user:YurNjWDcOZqLix@ttoundbackend.5jspqxd.mongodb.net/video_jobs_db?retryWrites=true&w=majority&appName=ttsoundbackend";
+
+async function connectDB() {
+  try {
+    await mongoose.connect(MONGO_URI);
+    console.log("Worker: MongoDB connected successfully");
+  } catch (error) {
+    console.error("Worker: MongoDB connection error:", error);
+    process.exit(1);
+  }
+}
+
+// MongoDB Schema
+const VideoJobSchema = new mongoose.Schema({
+  jobId: { type: String, required: true, unique: true },
+  status: { type: String, default: "pending" },
+  videoUrl: { type: String },
+  error: { type: String },
+  images: [{
+    url: String,
+    start: Number,
+    end: Number
+  }],
+  audioUrl: { type: String },
+  transitionSec: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+const VideoJob = mongoose.model("VideoJob", VideoJobSchema);
+
+// Redis client with better error handling
+let redisClient;
+
+async function createRedisClient() {
+  const client = redis.createClient({
+    url: process.env.REDIS_URL || "redis://localhost:6379"
+  });
+
+  client.on("error", (err) => console.log("Worker: Redis Client Error", err));
+  client.on("connect", () => console.log("Worker: Redis connected"));
+  client.on("ready", () => console.log("Worker: Redis ready"));
+  
+  await client.connect();
+  return client;
+}
+
+// S3/R2 Config
 const R2_ENDPOINT = process.env.CLOUDFLARE_R2_ENDPOINT;
 const R2_BUCKET = process.env.CLOUDFLARE_R2_BUCKET;
 const R2_ACCESS = process.env.CLOUDFLARE_R2_ACCESS_KEY;
 const R2_SECRET = process.env.CLOUDFLARE_R2_SECRET_KEY;
 const R2_PUBLIC_URL = process.env.CLOUDFLARE_R2_PUBLIC_URL;
 
-if (!R2_ENDPOINT || !R2_BUCKET || !R2_ACCESS || !R2_SECRET || !R2_PUBLIC_URL) {
-  console.warn("Warning: Some Cloudflare R2 env vars may be missing. Uploads will fail until configured.");
-}
-
-/* ---------- S3 client ---------- */
 const s3Client = new S3Client({
   region: "auto",
   endpoint: R2_ENDPOINT,
@@ -47,21 +87,6 @@ const s3Client = new S3Client({
     accessKeyId: R2_ACCESS,
     secretAccessKey: R2_SECRET,
   },
-});
-
-/* ---------- Express setup ---------- */
-const app = express();
-app.use(express.json({ limit: "250mb" }));
-app.use(cors());
-
-/* ---------- Multer (memory) ---------- */
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 30 * 1024 * 1024 }, // 30 MB
-  fileFilter: (req, file, cb) => {
-    if (/^image\/(png|jpeg|jpg|webp|gif)$/i.test(file.mimetype)) cb(null, true);
-    else cb(new Error("Only image files are allowed (png, jpg, webp, gif)."));
-  }
 });
 
 /* ---------- Helpers ---------- */
@@ -79,42 +104,18 @@ async function downloadToFile(url, destPath) {
   return destPath;
 }
 
-/* ---------- Route: upload-image ---------- */
-app.post("/upload-image", upload.single("image"), async (req, res) => {
+/* ---------- Video Processing Function ---------- */
+async function processVideoJob(jobData) {
+  const { jobId, audioUrl, images, transitionSec = 0 } = jobData;
+  
   try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    // Update job status to processing
+    await VideoJob.findOneAndUpdate(
+      { jobId },
+      { status: "processing", updatedAt: new Date() }
+    );
 
-    const file = req.file;
-    const mime = file.mimetype;
-    const ext = (mime.split("/")[1] || "png").replace("jpeg", "jpg");
-    const key = `images/${uuidv4()}.${ext}`;
-
-    await s3Client.send(new PutObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: key,
-      Body: file.buffer,
-      ContentType: mime,
-    }));
-
-    const publicUrl = `${R2_PUBLIC_URL}/${key}`;
-    return res.json({ url: publicUrl });
-  } catch (err) {
-    console.error("upload-image error:", err);
-    return res.status(500).json({ error: err.message || String(err) });
-  }
-});
-
-/* ---------- Route: stitch ---------- */
-/**
- * POST /stitch
- * body: { audioUrl: string, images: [{ url, start, end }, ...], transitionSec?: number (optional) }
- */
-app.post("/stitch", async (req, res) => {
-  try {
-    const { audioUrl, images, transitionSec = 0 } = req.body;
-    if (!audioUrl || !images || !Array.isArray(images) || images.length === 0) {
-      return res.status(400).json({ error: "Missing audioUrl or images" });
-    }
+    console.log(`Processing job ${jobId}`);
 
     // 1) Download audio
     const audioLocal = tempPath("audio.mp3");
@@ -126,7 +127,6 @@ app.post("/stitch", async (req, res) => {
 
     for (let i = 0; i < images.length; i++) {
       const item = images[i];
-      // calculate duration. fallback to 1.0 if not parseable
       const duration = Math.max(0.2, Number(item.end) - Number(item.start) || 1.0);
       durations.push(duration);
 
@@ -136,9 +136,7 @@ app.post("/stitch", async (req, res) => {
       const outVideo = tempPath(`clip${i}.mp4`);
       tempVideos.push(outVideo);
 
-      // Create a consistent 1080x1920 clip:
-      // - scale to fit width 1080 (keep aspect), then pad vertically to 1920 (centered)
-      // - setsar=1 and format ensures correct pixel format
+      // Create a consistent 1080x1920 clip
       await new Promise((resolve, reject) => {
         ffmpeg()
           .input(imgLocal)
@@ -150,8 +148,8 @@ app.post("/stitch", async (req, res) => {
             'format=yuv420p'
           ])
           .outputOptions([
-            `-t ${duration}`,   // duration per clip
-            '-r 30',            // fps
+            `-t ${duration}`,
+            '-r 30',
             '-c:v libx264',
             '-preset veryfast',
             '-crf 23',
@@ -159,14 +157,9 @@ app.post("/stitch", async (req, res) => {
             '-movflags +faststart'
           ])
           .on('start', cmd => console.log(`ffmpeg start (clip ${i}): ${cmd}`))
-          .on('stderr', line => {
-            // Uncomment to debug ffmpeg logs:
-            // console.log(`ffmpeg stderr (clip ${i}): ${line}`);
-          })
+          .on('stderr', line => {})
           .on('error', (err, stdout, stderr) => {
             console.error(`ffmpeg error while creating clip ${i}:`, err.message);
-            if (stdout) console.error("ffmpeg stdout:", stdout);
-            if (stderr) console.error("ffmpeg stderr:", stderr);
             reject(err);
           })
           .on('end', () => {
@@ -182,7 +175,6 @@ app.post("/stitch", async (req, res) => {
 
     // 3) Concatenate clips into single video and add audio
     const concatListPath = tempPath("concat.txt");
-    // concat demuxer requires forward slashes in the paths on Windows too; ensure safe 0 for absolute paths
     const concatContent = tempVideos.map(tv => `file '${tv.replace(/\\/g, "/")}'`).join("\n");
     await fs.writeFile(concatListPath, concatContent, "utf8");
 
@@ -194,24 +186,20 @@ app.post("/stitch", async (req, res) => {
         .inputOptions(['-f concat', '-safe 0'])
         .input(audioLocal)
         .outputOptions([
-          '-map 0:v',     // take video from concat file
-          '-map 1:a',     // take audio from audio file
+          '-map 0:v',
+          '-map 1:a',
           '-c:v libx264',
           '-r 30',
           '-pix_fmt yuv420p',
           '-c:a aac',
           '-b:a 128k',
-          '-shortest',    // ends when shortest stream ends (usually audio or video)
+          '-shortest',
           '-movflags +faststart'
         ])
         .on('start', cmd => console.log('ffmpeg start (concat):', cmd))
-        .on('stderr', line => {
-          // console.log('ffmpeg stderr (concat):', line);
-        })
+        .on('stderr', line => {})
         .on('error', (err, stdout, stderr) => {
           console.error('ffmpeg concat error:', err.message);
-          if (stdout) console.error('ffmpeg stdout:', stdout);
-          if (stderr) console.error('ffmpeg stderr:', stderr);
           reject(err);
         })
         .on('end', () => {
@@ -233,17 +221,80 @@ app.post("/stitch", async (req, res) => {
 
     const publicFinalUrl = `${R2_PUBLIC_URL}/${key}`;
 
-    // 5) cleanup
+    // 5) Update job with success
+    await VideoJob.findOneAndUpdate(
+      { jobId },
+      { 
+        status: "completed", 
+        videoUrl: publicFinalUrl,
+        updatedAt: new Date()
+      }
+    );
+
+    console.log(`Job ${jobId} completed successfully`);
+
+    // 6) cleanup
     const cleanupPaths = [audioLocal, concatListPath, finalLocal, ...tempVideos];
     await Promise.all(cleanupPaths.map(p => fs.unlink(p).catch(() => {})));
 
-    return res.json({ videoUrl: publicFinalUrl });
   } catch (err) {
-    console.error("stitch error:", err);
-    return res.status(500).json({ error: err.message || String(err) });
+    console.error(`Error processing job ${jobId}:`, err);
+    
+    // Update job with error
+    await VideoJob.findOneAndUpdate(
+      { jobId },
+      { 
+        status: "failed", 
+        error: err.message || String(err),
+        updatedAt: new Date()
+      }
+    );
   }
+}
+
+/* ---------- Worker Main Loop ---------- */
+async function startWorker() {
+  try {
+    await connectDB();
+    redisClient = await createRedisClient();
+    
+    console.log("Worker started, waiting for jobs...");
+
+    while (true) {
+      try {
+        // BRPOP will block until a job is available
+        const result = await redisClient.brPop("video-jobs", 0);
+        
+        if (result && result.element) {
+          const jobData = JSON.parse(result.element);
+          await processVideoJob(jobData);
+        }
+      } catch (err) {
+        console.error("Error in worker loop:", err);
+        // Wait a bit before retrying to avoid tight loop on errors
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+  } catch (err) {
+    console.error("Worker failed to start:", err);
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("Shutting down worker...");
+  if (redisClient) await redisClient.quit();
+  await mongoose.connection.close();
+  process.exit(0);
 });
 
-/* ---------- Start ---------- */
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Stitch server listening on ${PORT}`));
+process.on("SIGTERM", async () => {
+  console.log("Shutting down worker...");
+  if (redisClient) await redisClient.quit();
+  await mongoose.connection.close();
+  process.exit(0);
+});
+
+// Start the worker
+startWorker();

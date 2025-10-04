@@ -1,3 +1,4 @@
+// worker.js
 require("dotenv").config();
 
 // fetch fallback for Node < 18
@@ -25,7 +26,7 @@ const redis = require("redis");
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
-// MongoDB connection - Fixed connection string
+// MongoDB connection - Fixed connection string or use env
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://hellobittukumar12_db_user:YurNjWDcOZqLix@ttoundbackend.5jspqxd.mongodb.net/video_jobs_db?retryWrites=true&w=majority&appName=ttsoundbackend";
 
 async function connectDB() {
@@ -57,18 +58,13 @@ const VideoJobSchema = new mongoose.Schema({
 
 const VideoJob = mongoose.model("VideoJob", VideoJobSchema);
 
-// Redis client with better error handling
+// Redis client
 let redisClient;
-
 async function createRedisClient() {
-  const client = redis.createClient({
-    url: process.env.REDIS_URL || "redis://localhost:6379"
-  });
-
+  const client = redis.createClient({ url: process.env.REDIS_URL || "redis://localhost:6379" });
   client.on("error", (err) => console.log("Worker: Redis Client Error", err));
   client.on("connect", () => console.log("Worker: Redis connected"));
   client.on("ready", () => console.log("Worker: Redis ready"));
-  
   await client.connect();
   return client;
 }
@@ -123,12 +119,9 @@ async function processVideoJob(jobData) {
 
     // 2) Download images and create clips (force 1080x1920)
     const tempVideos = [];
-    const durations = [];
-
     for (let i = 0; i < images.length; i++) {
       const item = images[i];
       const duration = Math.max(0.2, Number(item.end) - Number(item.start) || 1.0);
-      durations.push(duration);
 
       const imgLocal = tempPath(`img${i}`);
       await downloadToFile(item.url, imgLocal);
@@ -136,7 +129,7 @@ async function processVideoJob(jobData) {
       const outVideo = tempPath(`clip${i}.mp4`);
       tempVideos.push(outVideo);
 
-      // Create a consistent 1080x1920 clip
+      // Create clip
       await new Promise((resolve, reject) => {
         ffmpeg()
           .input(imgLocal)
@@ -157,9 +150,11 @@ async function processVideoJob(jobData) {
             '-movflags +faststart'
           ])
           .on('start', cmd => console.log(`ffmpeg start (clip ${i}): ${cmd}`))
-          .on('stderr', line => {})
+          .on('stderr', line => console.log(`ffmpeg stderr (clip ${i}): ${line}`))
           .on('error', (err, stdout, stderr) => {
             console.error(`ffmpeg error while creating clip ${i}:`, err.message);
+            if (stdout) console.error("ffmpeg stdout:", stdout);
+            if (stderr) console.error("ffmpeg stderr:", stderr);
             reject(err);
           })
           .on('end', () => {
@@ -169,45 +164,88 @@ async function processVideoJob(jobData) {
           .save(outVideo);
       });
 
-      // remove local image copy
       await fs.unlink(imgLocal).catch(() => {});
     }
 
     // 3) Concatenate clips into single video and add audio
-    const concatListPath = tempPath("concat.txt");
-    const concatContent = tempVideos.map(tv => `file '${tv.replace(/\\/g, "/")}'`).join("\n");
-    await fs.writeFile(concatListPath, concatContent, "utf8");
-
     const finalLocal = tempPath("final.mp4");
 
-    await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(concatListPath)
-        .inputOptions(['-f concat', '-safe 0'])
-        .input(audioLocal)
-        .outputOptions([
-          '-map 0:v',
-          '-map 1:a',
-          '-c:v libx264',
-          '-r 30',
-          '-pix_fmt yuv420p',
-          '-c:a aac',
-          '-b:a 128k',
-          '-shortest',
-          '-movflags +faststart'
-        ])
-        .on('start', cmd => console.log('ffmpeg start (concat):', cmd))
-        .on('stderr', line => {})
-        .on('error', (err, stdout, stderr) => {
-          console.error('ffmpeg concat error:', err.message);
-          reject(err);
-        })
-        .on('end', () => {
-          console.log('Created final video ->', finalLocal);
-          resolve();
-        })
-        .save(finalLocal);
-    });
+    if (tempVideos.length === 1) {
+      // single clip: mux audio and re-encode to ensure compatibility
+      await new Promise((resolve, reject) => {
+        ffmpeg()
+          .input(tempVideos[0])
+          .input(audioLocal)
+          .outputOptions([
+            '-map 0:v',
+            '-map 1:a',
+            '-c:v libx264',
+            '-preset veryfast',
+            '-crf 23',
+            '-pix_fmt yuv420p',
+            '-c:a aac',
+            '-b:a 128k',
+            '-shortest',
+            '-movflags +faststart'
+          ])
+          .on('start', cmd => console.log('ffmpeg start (single clip mux):', cmd))
+          .on('stderr', line => console.log('ffmpeg stderr (single clip mux):', line))
+          .on('error', (err, stdout, stderr) => {
+            console.error('ffmpeg single-clip error:', err.message);
+            if (stdout) console.error('ffmpeg stdout:', stdout);
+            if (stderr) console.error('ffmpeg stderr:', stderr);
+            reject(err);
+          })
+          .on('end', () => {
+            console.log('Created final video ->', finalLocal);
+            resolve();
+          })
+          .save(finalLocal);
+      });
+
+    } else {
+      // multiple clips: use concat filter (avoid concat demuxer issues)
+      await new Promise((resolve, reject) => {
+        const ff = ffmpeg();
+
+        // add all videos as inputs first
+        for (const v of tempVideos) ff.input(v);
+        // add audio as last input
+        ff.input(audioLocal);
+
+        // build concat filter string for inputs: [0:v:0][1:v:0]...[K-1:v:0]concat=n=K:v=1:a=0[v]
+        const videoInputs = tempVideos.map((_, i) => `[${i}:v:0]`).join('');
+        const filter = `${videoInputs}concat=n=${tempVideos.length}:v=1:a=0[v]`;
+
+        // IMPORTANT: do NOT pass second argument to complexFilter (that created duplicate mapping)
+        ff.complexFilter([filter]) // <-- no outputs array here
+          .outputOptions([
+            '-map [v]',
+            `-map ${tempVideos.length}:a`, // audio index is last input
+            '-c:v libx264',
+            '-preset veryfast',
+            '-crf 23',
+            '-pix_fmt yuv420p',
+            '-c:a aac',
+            '-b:a 128k',
+            '-shortest',
+            '-movflags +faststart'
+          ])
+          .on('start', cmd => console.log('ffmpeg start (concat):', cmd))
+          .on('stderr', line => console.log('ffmpeg stderr (concat):', line))
+          .on('error', (err, stdout, stderr) => {
+            console.error('ffmpeg concat error:', err.message);
+            if (stdout) console.error('ffmpeg stdout:', stdout);
+            if (stderr) console.error('ffmpeg stderr:', stderr);
+            reject(err);
+          })
+          .on('end', () => {
+            console.log('Created final video ->', finalLocal);
+            resolve();
+          })
+          .save(finalLocal);
+      });
+    }
 
     // 4) Upload final video to R2
     const finalBuffer = await fs.readFile(finalLocal);
@@ -224,30 +262,22 @@ async function processVideoJob(jobData) {
     // 5) Update job with success
     await VideoJob.findOneAndUpdate(
       { jobId },
-      { 
-        status: "completed", 
-        videoUrl: publicFinalUrl,
-        updatedAt: new Date()
-      }
+      { status: "completed", videoUrl: publicFinalUrl, updatedAt: new Date() }
     );
 
     console.log(`Job ${jobId} completed successfully`);
 
     // 6) cleanup
-    const cleanupPaths = [audioLocal, concatListPath, finalLocal, ...tempVideos];
+    const cleanupPaths = [audioLocal, finalLocal, ...tempVideos];
     await Promise.all(cleanupPaths.map(p => fs.unlink(p).catch(() => {})));
 
   } catch (err) {
     console.error(`Error processing job ${jobId}:`, err);
-    
+
     // Update job with error
     await VideoJob.findOneAndUpdate(
       { jobId },
-      { 
-        status: "failed", 
-        error: err.message || String(err),
-        updatedAt: new Date()
-      }
+      { status: "failed", error: err.message || String(err), updatedAt: new Date() }
     );
   }
 }
@@ -257,21 +287,18 @@ async function startWorker() {
   try {
     await connectDB();
     redisClient = await createRedisClient();
-    
+
     console.log("Worker started, waiting for jobs...");
 
     while (true) {
       try {
-        // BRPOP will block until a job is available
         const result = await redisClient.brPop("video-jobs", 0);
-        
         if (result && result.element) {
           const jobData = JSON.parse(result.element);
           await processVideoJob(jobData);
         }
       } catch (err) {
         console.error("Error in worker loop:", err);
-        // Wait a bit before retrying to avoid tight loop on errors
         await new Promise(resolve => setTimeout(resolve, 5000));
       }
     }
@@ -281,7 +308,7 @@ async function startWorker() {
   }
 }
 
-// Handle graceful shutdown
+// graceful shutdown
 process.on("SIGINT", async () => {
   console.log("Shutting down worker...");
   if (redisClient) await redisClient.quit();
@@ -296,5 +323,4 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-// Start the worker
 startWorker();

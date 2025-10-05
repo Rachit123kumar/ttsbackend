@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0   # fetch full history so diffs work reliably
 
       - name: Detect changed files
         id: changes
@@ -24,8 +26,18 @@ jobs:
           echo "CHANGED_BACKEND=false" >> $GITHUB_ENV
           echo "CHANGED_WORKER=false" >> $GITHUB_ENV
 
-          git fetch origin main
-          CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
+          # ensure the ref is fetched (checkout --fetch-depth=0 above should be enough)
+          git fetch --no-tags --prune origin ${{ github.ref }} || true
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            # First push for this ref — list files touched in the pushed commit(s)
+            CHANGED_FILES=$(git show --name-only --pretty="" "$AFTER" | sed '/^$/d' | sort -u)
+          else
+            CHANGED_FILES=$(git diff --name-only "$BEFORE" "$AFTER" | sed '/^$/d' | sort -u)
+          fi
 
           echo "Changed files: $CHANGED_FILES"
 
@@ -43,7 +55,7 @@ jobs:
           host: ${{ secrets.AZURE_HOST }}
           username: ${{ secrets.AZURE_USER }}
           key: ${{ secrets.AZURE_SSH_KEY }}
-          script_stop: true   # 🚨 stops if any command fails
+          script_stop: true
           script: |
             cd ~/ttsbackend
             git reset --hard

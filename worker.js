@@ -27,7 +27,7 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
 // MongoDB connection - Fixed connection string or use env
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://hellobittukumar12_db_user:YurNjWDcOZqLix@ttoundbackend.5jspqxd.mongodb.net/video_jobs_db?retryWrites=true&w=majority&appName=ttsoundbackend";
+const MONGO_URI = process.env.MONGO_URI 
 
 async function connectDB() {
   try {

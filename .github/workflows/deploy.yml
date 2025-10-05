@@ -1,0 +1,61 @@
+name: Deploy Node.js Services to Azure VM
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend.js"
+      - "worker.js"
+      - "package.json"
+      - "package-lock.json"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Detect changed files
+        id: changes
+        run: |
+          echo "CHANGED_BACKEND=false" >> $GITHUB_ENV
+          echo "CHANGED_WORKER=false" >> $GITHUB_ENV
+
+          git fetch origin main
+          CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
+
+          echo "Changed files: $CHANGED_FILES"
+
+          if echo "$CHANGED_FILES" | grep -q "backend.js"; then
+            echo "CHANGED_BACKEND=true" >> $GITHUB_ENV
+          fi
+
+          if echo "$CHANGED_FILES" | grep -q "worker.js"; then
+            echo "CHANGED_WORKER=true" >> $GITHUB_ENV
+          fi
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.AZURE_HOST }}
+          username: ${{ secrets.AZURE_USER }}
+          key: ${{ secrets.AZURE_SSH_KEY }}
+          script_stop: true   # 🚨 stops if any command fails
+          script: |
+            cd ~/ttsbackend
+            git reset --hard
+            git pull origin main
+            npm install --production
+
+            if [ "${CHANGED_BACKEND}" = "true" ]; then
+              echo "Restarting backend.js..."
+              pm2 restart backend || pm2 start backend.js --name backend
+            fi
+
+            if [ "${CHANGED_WORKER}" = "true" ]; then
+              echo "Restarting worker.js..."
+              pm2 restart worker || pm2 start worker.js --name worker
+            fi
